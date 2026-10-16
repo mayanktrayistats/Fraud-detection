@@ -9,9 +9,9 @@ export interface RiskConfig {
 }
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
-  hardLieWeight: 35,
-  automationWeight: 30,
-  warningWeight: 10,
+  hardLieWeight: 60, // A single hard lie immediately crosses threshold 50!
+  automationWeight: 60, // Automation immediately crosses threshold 50!
+  warningWeight: 15,
   highRiskThreshold: 50,
   reviewThreshold: 20
 };
@@ -30,37 +30,40 @@ export function classifyRisk(
   for (const diag of diagnostics) {
     if (diag.status !== 'detected') continue;
 
-    // Categorize
+    // Hard technical lie (spoofing contradiction)
     if (diag.isLie) {
       liesCount++;
       score += config.hardLieWeight;
-      reasons.push(`[Hard Discrepancy] ${diag.testName}: ${diag.explanation}`);
+      reasons.push(`[HARD LIE DETECTED] ${diag.testName}: ${diag.explanation}`);
     }
 
+    // Automation / Headless
     if (diag.category === 'automation' || diag.category === 'headless') {
       automationDetected = true;
       score += config.automationWeight;
-      reasons.push(`[Automation/Headless] ${diag.testName} detected.`);
+      reasons.push(`[AUTOMATION/HEADLESS] ${diag.testName}: ${diag.explanation}`);
     }
 
+    // Privacy / Extension
     if (diag.category === 'privacy_resistance' || diag.testId === 'rendering_canvas_noise') {
       isPrivacyMode = true;
-      // Note: privacy protections alone do NOT cause high risk; they cause 'review' with moderate weight
       score += config.warningWeight;
-      reasons.push(`[Privacy/Resistance] ${diag.testName}: User may be using privacy extensions or anti-tracking features.`);
+      reasons.push(`[PRIVACY/SHIELD] ${diag.testName}: ${diag.explanation}`);
     }
 
+    // Warning
     if (diag.isWarning && !diag.isLie && diag.category !== 'privacy_resistance') {
       warningsCount++;
       score += config.warningWeight;
-      reasons.push(`[Anomaly Warning] ${diag.testName}: ${diag.observedResult}`);
+      reasons.push(`[ANOMALY WARNING] ${diag.testName}: ${diag.observedResult}`);
     }
   }
 
   score = Math.min(100, score);
 
+  // Strict Risk Tier Assignment
   let tier: RiskTier = 'Low risk (Real user)';
-  if (score >= config.highRiskThreshold || liesCount >= 2) {
+  if (liesCount >= 1 || automationDetected || score >= config.highRiskThreshold) {
     tier = 'High risk (Suspicious / Bot)';
   } else if (score >= config.reviewThreshold || isPrivacyMode || warningsCount >= 1) {
     tier = 'Needs further review';

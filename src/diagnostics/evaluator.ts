@@ -11,12 +11,12 @@ export function runDiagnostics(signals: {
   system: any;
   resistance: any;
   webrtc: any;
+  speech: any;
   consistency: any;
 }): DiagnosticResult[] {
   const tests: DiagnosticResult[] = [];
   const start = performance.now();
 
-  // Helper
   const add = (
     testId: string,
     testName: string,
@@ -46,7 +46,284 @@ export function runDiagnostics(signals: {
     });
   };
 
-  // 1. Automation Indicators
+  const ua = navigator.userAgent;
+  const platform = navigator.platform;
+  const gpu = signals.webgl.unmaskedRenderer || signals.webgl.renderer || '';
+
+  // ==========================================
+  // 1. PROTOTYPE TAMPERING & HOOKING CHECKS
+  // ==========================================
+
+  // Check 1A: Direct property ownership (anti-detect tools & extensions do Object.defineProperty on navigator)
+  const navOwnProperties: string[] = [];
+  const propsToCheck = ['userAgent', 'platform', 'hardwareConcurrency', 'deviceMemory', 'languages', 'webdriver', 'plugins', 'mimeTypes'];
+  for (const prop of propsToCheck) {
+    if (Object.prototype.hasOwnProperty.call(navigator, prop)) {
+      navOwnProperties.push(prop);
+    }
+  }
+  const hasOwnNavProps = navOwnProperties.length > 0;
+  add(
+    'proto_nav_ownership',
+    'Navigator Property Ownership (Hook Detection)',
+    'automation',
+    hasOwnNavProps ? 'detected' : 'not_detected',
+    hasOwnNavProps ? `Overridden directly on navigator: ${navOwnProperties.join(', ')}` : 'Inherited natively from Navigator.prototype',
+    'Navigator properties must strictly exist on Navigator.prototype, not as own properties',
+    'Extensions and anti-detect tools hook navigator by defining own properties directly on the instance.',
+    { ownProperties: navOwnProperties },
+    'high',
+    hasOwnNavProps,
+    false
+  );
+
+  // Check 1B: Illegal Invocation check on native getter
+  let getterTampered = false;
+  let getterErrorMsg = '';
+  try {
+    const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent');
+    if (desc && desc.get) {
+      try {
+        // Calling native getter with non-Navigator object MUST throw TypeError
+        Reflect.get(Navigator.prototype, 'userAgent', {});
+        getterTampered = true; // Did not throw -> fake JS getter!
+        getterErrorMsg = 'Getter returned value without checking receiver';
+      } catch (err: any) {
+        if (!err.message?.includes('Illegal invocation') && !err.message?.includes('does not implement')) {
+          getterTampered = true;
+          getterErrorMsg = `Unexpected error: ${err.message}`;
+        }
+      }
+    }
+  } catch {}
+  add(
+    'proto_getter_invocation',
+    'Native Prototype Method Trapping',
+    'automation',
+    getterTampered ? 'detected' : 'not_detected',
+    getterTampered ? `Trapped/Hooked getter: ${getterErrorMsg}` : 'Native C++ binding verified',
+    'Native getters throw TypeError: Illegal invocation on invalid receiver',
+    'Spoofed getters implemented via custom JavaScript or Proxies fail native receiver validation.',
+    { getterTampered, getterErrorMsg },
+    'high',
+    getterTampered,
+    false
+  );
+
+  // ==========================================
+  // 2. BROWSER BRAND & ARCHITECTURE INVARIANTS
+  // ==========================================
+
+  // Check 2A: Fake Safari (Safari NEVER has window.chrome or navigator.userAgentData)
+  const claimsSafari = ua.includes('Safari') && !ua.includes('Chrome') && !ua.includes('Edg') && !ua.includes('Android');
+  const hasChromeObject = !!(window as any).chrome;
+  const hasUserAgentData = !!(navigator as any).userAgentData;
+  const fakeSafari = claimsSafari && (hasChromeObject || hasUserAgentData);
+  add(
+    'brand_fake_safari',
+    'Safari Architecture Authenticity',
+    'user_agent',
+    fakeSafari ? 'detected' : 'not_detected',
+    fakeSafari ? `Claims Safari but contains ${hasChromeObject ? 'window.chrome ' : ''}${hasUserAgentData ? 'navigator.userAgentData' : ''}` : 'Consistent',
+    'Genuine Safari does not support Chromium window.chrome or Client Hints API',
+    'Fake Safari User-Agent running inside a Chromium-based fake browser or spoofer.',
+    { claimsSafari, hasChromeObject, hasUserAgentData },
+    'high',
+    fakeSafari,
+    false
+  );
+
+  // Check 2B: Fake Firefox (Firefox NEVER has window.chrome or navigator.userAgentData)
+  const claimsFirefox = ua.includes('Firefox');
+  const fakeFirefox = claimsFirefox && (hasChromeObject || hasUserAgentData);
+  add(
+    'brand_fake_firefox',
+    'Firefox Architecture Authenticity',
+    'user_agent',
+    fakeFirefox ? 'detected' : 'not_detected',
+    fakeFirefox ? `Claims Firefox but contains ${hasChromeObject ? 'window.chrome ' : ''}${hasUserAgentData ? 'navigator.userAgentData' : ''}` : 'Consistent',
+    'Genuine Firefox does not implement window.chrome or Chromium Client Hints',
+    'Fake Firefox User-Agent running inside a Chromium-based fake browser or spoofer.',
+    { claimsFirefox, hasChromeObject, hasUserAgentData },
+    'high',
+    fakeFirefox,
+    false
+  );
+
+  // Check 2C: Fake Mobile (claims iPhone or Android, but zero touch or desktop platform)
+  const claimsPhone = ua.includes('iPhone') || ua.includes('Android');
+  const touchPoints = navigator.maxTouchPoints || 0;
+  const desktopPlatformOnPhone = claimsPhone && (platform.includes('Win') || platform.includes('MacIntel') || platform.includes('Linux x86'));
+  const noTouchOnPhone = claimsPhone && touchPoints === 0;
+  const fakeMobile = desktopPlatformOnPhone || noTouchOnPhone;
+  add(
+    'brand_fake_mobile',
+    'Mobile Device Emulation Contradiction',
+    'hardware_os',
+    fakeMobile ? 'detected' : 'not_detected',
+    fakeMobile ? `Claims phone but platform is "${platform}" with ${touchPoints} touch points` : 'Consistent mobile profile',
+    'Mobile devices must have touch support and native mobile OS platforms',
+    'Chrome DevTools mobile emulation or fake browser faking mobile User-Agent on desktop.',
+    { claimsPhone, platform, touchPoints },
+    'high',
+    fakeMobile,
+    false
+  );
+
+  // ==========================================
+  // 3. HARDWARE & GPU VS OS CONTRADICTIONS
+  // ==========================================
+
+  // Check 3A: GPU vs OS Mismatch
+  let gpuOsContradiction = false;
+  let gpuOsReason = 'GPU renderer compatible with reported OS';
+  const claimsMacOrIOS = ua.includes('Macintosh') || ua.includes('iPhone') || ua.includes('iPad');
+  const claimsWindows = ua.includes('Windows');
+
+  if (claimsMacOrIOS && (gpu.includes('Direct3D') || gpu.includes('NVIDIA') || gpu.includes('AMD Radeon') || gpu.includes('Intel(R)'))) {
+    // Note: modern Macs use Apple M1/M2/M3 GPUs or Metal, never Direct3D (DirectX is Windows only)
+    if (gpu.includes('Direct3D')) {
+      gpuOsContradiction = true;
+      gpuOsReason = 'User-Agent claims Apple macOS/iOS, but WebGL graphics is Direct3D (Windows DirectX)';
+    }
+  } else if (claimsWindows && (gpu.includes('Apple M') || gpu.includes('Metal') || gpu.includes('Apple GPU'))) {
+    gpuOsContradiction = true;
+    gpuOsReason = 'User-Agent claims Windows, but WebGL graphics is Apple Silicon Metal GPU';
+  } else if (gpu.includes('SwiftShader') || gpu.includes('llvmpipe')) {
+    gpuOsContradiction = true;
+    gpuOsReason = 'Software emulation GPU (SwiftShader / llvmpipe) detected: running in headless server or cloud VM';
+  }
+
+  add(
+    'hardware_os_gpu_match',
+    'OS & WebGL Graphics Subsystem Compatibility',
+    'hardware_os',
+    gpuOsContradiction ? 'detected' : 'not_detected',
+    gpu || 'unsupported',
+    'Native GPU vendor matching OS graphics framework',
+    gpuOsReason,
+    { userAgent: ua, gpuRenderer: gpu },
+    'high',
+    gpuOsContradiction,
+    false
+  );
+
+  // Check 3B: Speech voices leaking underlying host OS
+  let voiceOsMismatch = false;
+  let voiceMismatchReason = '';
+  const voices = signals.speech.voicesList || [];
+  const defaultVoice = signals.speech.defaultVoice || '';
+  if (claimsMacOrIOS || ua.includes('Linux') || ua.includes('Android')) {
+    if (defaultVoice.includes('Microsoft') || voices.some((v: string) => v.includes('Microsoft David') || v.includes('Microsoft Zira'))) {
+      voiceOsMismatch = true;
+      voiceMismatchReason = `Browser claims ${claimsMacOrIOS ? 'macOS/iOS' : 'Linux'}, but installed speech voices are Windows SAPI (Microsoft David/Zira)`;
+    }
+  } else if (claimsWindows) {
+    if (defaultVoice.includes('Samantha') || defaultVoice.includes('Alex') || voices.some((v: string) => v.includes('Samantha (en-US)'))) {
+      voiceOsMismatch = true;
+      voiceMismatchReason = 'Browser claims Windows, but installed speech voices are Apple macOS voice packs (Samantha/Alex)';
+    }
+  }
+  add(
+    'hardware_voice_os_match',
+    'Speech Voice Pack & Host OS Correlation',
+    'hardware_os',
+    voiceOsMismatch ? 'detected' : 'not_detected',
+    voiceOsMismatch ? voiceMismatchReason : 'Voices match reported OS',
+    'Installed speech synthesis voices must match host OS voice engines',
+    'Fake browser modified User-Agent but could not fake the underlying OS system voices.',
+    { defaultVoice, voiceOsMismatch },
+    'high',
+    voiceOsMismatch,
+    false
+  );
+
+  // ==========================================
+  // 4. SCOPE PARITY & TIMEZONE CONSISTENCY
+  // ==========================================
+
+  // Check 4A: Worker vs Window Scope Parity
+  const workerMismatches = signals.worker.mismatchesWithWindow || [];
+  const hasWorkerMismatch = workerMismatches.length > 0;
+  add(
+    'consistency_worker_window',
+    'Worker vs Window Scope Parity',
+    'consistency',
+    hasWorkerMismatch ? 'detected' : 'not_detected',
+    hasWorkerMismatch ? workerMismatches.join('; ') : 'All worker properties match window',
+    'Identical navigator and hardware values across scopes',
+    'Anti-detect scripts often inject overrides in window scope while neglecting Web Worker scopes.',
+    { mismatches: workerMismatches },
+    'high',
+    hasWorkerMismatch,
+    false
+  );
+
+  // Check 4B: Timezone vs Date Offset Contradiction
+  let tzMismatch = false;
+  let tzReason = '';
+  try {
+    const tzName = signals.intl.timezone.name;
+    const reportedOffset = new Date().getTimezoneOffset();
+    // Verify Intl timezone vs actual offset
+    const dtf = new Intl.DateTimeFormat('en-US', { timeZone: tzName, timeZoneName: 'shortOffset' });
+    const parts = dtf.formatToParts(new Date());
+    const offsetPart = parts.find(p => p.type === 'timeZoneName');
+    if (offsetPart && offsetPart.value.startsWith('GMT')) {
+      const match = offsetPart.value.match(/GMT([+-])(\d+)(?::(\d+))?/);
+      if (match) {
+        const sign = match[1] === '+' ? -1 : 1;
+        const hours = parseInt(match[2], 10);
+        const mins = match[3] ? parseInt(match[3], 10) : 0;
+        const expectedOffset = sign * (hours * 60 + mins);
+        if (Math.abs(expectedOffset - reportedOffset) > 60) {
+          tzMismatch = true;
+          tzReason = `Intl timezone "${tzName}" implies offset ${expectedOffset}m, but Date offset is ${reportedOffset}m`;
+        }
+      }
+    }
+  } catch {}
+  add(
+    'timezone_offset_parity',
+    'Timezone & Date Offset Mathematical Integrity',
+    'consistency',
+    tzMismatch ? 'detected' : 'not_detected',
+    tzMismatch ? tzReason : 'Timezone mathematically consistent with Date offset',
+    'Reported Intl timezone must strictly equal the native Date().getTimezoneOffset()',
+    'Proxy or anti-detect tool changed timezone string but failed to alter underlying epoch offset calculation.',
+    { timezone: signals.intl.timezone.name, reportedOffset: new Date().getTimezoneOffset() },
+    'high',
+    tzMismatch,
+    false
+  );
+
+  // ==========================================
+  // 5. SCREEN & GEOMETRY BOUNDS
+  // ==========================================
+
+  const sW = screen.width;
+  const sH = screen.height;
+  const aW = screen.availWidth;
+  const aH = screen.availHeight;
+  const invalidScreen = aW > sW || aH > sH || sW === 0 || sH === 0;
+  add(
+    'screen_geometry_bounds',
+    'Screen & Viewport Physical Geometry Invariants',
+    'hardware_os',
+    invalidScreen ? 'detected' : 'not_detected',
+    invalidScreen ? `avail (${aW}x${aH}) exceeds screen (${sW}x${sH})` : 'Valid physical dimensions',
+    'Available screen size cannot exceed physical monitor resolution',
+    'Anti-detect browsers often spoof screen properties with impossible physical dimensions.',
+    { screen: `${sW}x${sH}`, avail: `${aW}x${aH}` },
+    'high',
+    invalidScreen,
+    false
+  );
+
+  // ==========================================
+  // 6. AUTOMATION & HEADLESS CHECKS
+  // ==========================================
+
   const wd = signals.headless.webdriver;
   add(
     'auto_webdriver',
@@ -77,22 +354,6 @@ export function runDiagnostics(signals: {
     false
   );
 
-  // 2. Headless-Browser Indicators
-  const zeroDim = signals.headless.details.zeroDimensions;
-  add(
-    'headless_dimensions',
-    'Window Dimension Bounds',
-    'headless',
-    zeroDim ? 'detected' : 'not_detected',
-    `outerWidth: ${signals.screen.outerWidth}, outerHeight: ${signals.screen.outerHeight}`,
-    'Non-zero screen outer dimensions',
-    'Headless browsers often initialize with outerWidth and outerHeight equal to 0.',
-    { outerWidth: signals.screen.outerWidth, outerHeight: signals.screen.outerHeight },
-    'high',
-    zeroDim,
-    false
-  );
-
   const permMismatch = signals.headless.details.permissionsMismatch;
   add(
     'headless_permissions_mismatch',
@@ -108,24 +369,7 @@ export function runDiagnostics(signals: {
     false
   );
 
-  // 3. Worker vs Window Inconsistency (Hard Lie)
-  const workerMismatches = signals.worker.mismatchesWithWindow || [];
-  const hasWorkerMismatch = workerMismatches.length > 0;
-  add(
-    'consistency_worker_window',
-    'Worker vs Window Scope Parity',
-    'consistency',
-    hasWorkerMismatch ? 'detected' : 'not_detected',
-    hasWorkerMismatch ? workerMismatches.join('; ') : 'All worker properties match window',
-    'Identical navigator and hardware values across scopes',
-    'Anti-detect scripts often inject overrides in window scope while neglecting Web Worker scopes.',
-    { mismatches: workerMismatches },
-    'high',
-    hasWorkerMismatch,
-    false
-  );
-
-  // 4. Rendering Anomalies (Canvas Noise & WebGL)
+  // 7. Dynamic Canvas Noise
   const noise = signals.resistance.canvasNoiseDetected;
   add(
     'rendering_canvas_noise',
@@ -138,132 +382,7 @@ export function runDiagnostics(signals: {
     { canvasNoiseDetected: noise },
     'high',
     false,
-    noise // warning / privacy flag, not malicious lie
-  );
-
-  // 5. User-Agent vs Client Hints
-  const ua = signals.system.navigator.userAgent;
-  const uad = signals.system.navigator.userAgentData;
-  let uaMismatch = false;
-  let uaExplanation = 'User-Agent and Client Hints match reported platform';
-  if (uad && uad.platform) {
-    if (ua.includes('Windows') && !uad.platform.includes('Win')) {
-      uaMismatch = true;
-      uaExplanation = `User-Agent reports Windows but Client Hints platform reports "${uad.platform}"`;
-    } else if (ua.includes('Macintosh') && !uad.platform.includes('macOS')) {
-      uaMismatch = true;
-      uaExplanation = `User-Agent reports macOS but Client Hints platform reports "${uad.platform}"`;
-    }
-  }
-  add(
-    'ua_client_hints_match',
-    'User-Agent & Client Hints Alignment',
-    'user_agent',
-    uaMismatch ? 'detected' : 'not_detected',
-    uaMismatch ? uaExplanation : 'Aligned',
-    'Matching OS family across UA string and navigator.userAgentData',
-    'Inconsistencies between modern UserAgentData and legacy User-Agent string indicate incomplete spoofing.',
-    { userAgent: ua, userAgentData: uad },
-    'high',
-    uaMismatch,
-    false
-  );
-
-  // 6. OS vs GPU Renderer Contradiction
-  const gpu = signals.webgl.unmaskedRenderer || '';
-  let gpuOsContradiction = false;
-  let gpuOsReason = 'GPU renderer compatible with reported OS';
-  if (ua.includes('Macintosh') && gpu.includes('Direct3D')) {
-    gpuOsContradiction = true;
-    gpuOsReason = 'Browser reports macOS User-Agent but WebGL renderer reports DirectX / Direct3D (Windows-only)';
-  } else if ((ua.includes('iPhone') || ua.includes('iPad')) && (gpu.includes('Direct3D') || gpu.includes('Intel'))) {
-    gpuOsContradiction = true;
-    gpuOsReason = 'Browser reports iOS device but WebGL renderer reports desktop Intel / Direct3D graphics';
-  } else if (gpu.includes('SwiftShader') || gpu.includes('llvmpipe')) {
-    gpuOsReason = 'Software emulation GPU (SwiftShader / llvmpipe) detected, typical of cloud VMs or headless servers';
-  }
-  add(
-    'hardware_os_gpu_match',
-    'OS & WebGL Graphics Subsystem Compatibility',
-    'hardware_os',
-    gpuOsContradiction ? 'detected' : gpu.includes('SwiftShader') ? 'detected' : 'not_detected',
-    gpu || 'unknown',
-    'Native GPU vendor matching OS graphics framework',
-    gpuOsReason,
-    { userAgent: ua, gpuRenderer: gpu },
-    'high',
-    gpuOsContradiction,
-    gpu.includes('SwiftShader')
-  );
-
-  // 7. WebRTC Network Candidate Observations
-  const webrtcSupported = signals.webrtc.supported;
-  const isMDNS = signals.webrtc.hostCandidate.includes('.local');
-  add(
-    'webrtc_mdns_masking',
-    'WebRTC Host Candidate Protection',
-    'webrtc_network',
-    webrtcSupported ? 'detected' : 'not_supported',
-    isMDNS ? 'mDNS obfuscated (.local)' : signals.webrtc.hostCandidate || 'No host candidate',
-    'mDNS obfuscation on modern Chromium',
-    'Checks whether WebRTC hides local IP addresses using mDNS candidates as mandated by modern privacy standards.',
-    { hostCandidate: signals.webrtc.hostCandidate, publicIp: signals.webrtc.publicIp },
-    'medium',
-    false,
-    false
-  );
-
-  // 8. Privacy & Resistance Protections
-  const hasBrave = signals.resistance.hasBraveShields;
-  const hasRFP = signals.resistance.hasFirefoxRFP;
-  add(
-    'privacy_resistance_engine',
-    'Browser Privacy Resistance Mechanism',
-    'privacy_resistance',
-    hasBrave || hasRFP ? 'detected' : 'not_detected',
-    hasBrave ? 'Brave Shields active' : hasRFP ? 'Firefox resistFingerprinting active' : 'None detected',
-    'Standard consumer browser configuration',
-    'Recognizes standardized privacy features that intentionally round metrics or restrict APIs.',
-    { braveShields: hasBrave, firefoxRFP: hasRFP },
-    'high',
-    false,
-    hasBrave || hasRFP
-  );
-
-  // 9. Missing or Restricted APIs
-  const missingApis: string[] = [];
-  if (!signals.webgl.supported) missingApis.push('WebGL');
-  if (!signals.audio.dataHash) missingApis.push('OfflineAudioContext');
-  if (!signals.webrtc.supported) missingApis.push('WebRTC');
-  add(
-    'missing_restricted_apis',
-    'Essential Browser Hardware APIs',
-    'missing_apis',
-    missingApis.length > 0 ? 'detected' : 'not_detected',
-    missingApis.length > 0 ? `Restricted: ${missingApis.join(', ')}` : 'All available',
-    'WebGL, AudioContext, and WebRTC present in standard desktop browsers',
-    'Evaluates whether core browser APIs are absent due to policy, security sandboxing, or restricted environments.',
-    { missing: missingApis },
-    'medium',
-    false,
-    missingApis.length > 0
-  );
-
-  // 10. Changes Across Repeated Sessions
-  const sessionAnomalies = signals.consistency.anomaliesDetected || [];
-  const hasSessionAnomalies = sessionAnomalies.length > 0;
-  add(
-    'session_changes_anomalies',
-    'Inter-Session Consistency Verification',
-    'session_changes',
-    hasSessionAnomalies ? 'detected' : 'not_detected',
-    hasSessionAnomalies ? sessionAnomalies.join('; ') : 'Consistent with previous sessions',
-    'Stable hardware and identity across sequential sessions',
-    'Detects session-hopping where User-Agents or profiles rotate while underlying hardware signatures remain static.',
-    { sessionCount: signals.consistency.previousSessionCount, anomalies: sessionAnomalies },
-    'high',
-    hasSessionAnomalies,
-    false
+    noise
   );
 
   return tests;
