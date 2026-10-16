@@ -1,0 +1,18 @@
+{
+  "name": "creep-prototype",
+  "version": "1.0.0",
+  "description": "CreepJS-inspired browser fingerprinting and fraud detection prototype",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.1"
+  }
+}
